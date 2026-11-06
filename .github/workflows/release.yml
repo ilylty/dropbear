@@ -32,56 +32,54 @@ jobs:
           git update-index --chmod=+x build.sh || true
           git update-index --chmod=+x build-sftp-server.sh || true
 
+      # dropbear is the part that matters; it must succeed.
       - name: Build static dropbear (musl + android passwd patch)
         run: ./build.sh
 
       - name: Show dropbear outputs
-        run: ls -l dropbear-*.tar.xz* 2>/dev/null || ls -l out/
+        run: ls -l out/
 
-      - name: Build static sftp-server (OpenSSH)
+      # sftp-server is optional (only needed for `sftp`). Don't fail the run.
+      - name: Build static sftp-server (OpenSSH, optional)
+        continue-on-error: true
         env:
           OPENSSH_VERSION: 9.8p1
         run: ./build-sftp-server.sh
 
       - name: Show sftp outputs
-        run: ls -l sftp-server-*.tar.xz* 2>/dev/null || true
+        run: ls -l out/ sftp-server-*.tar.xz* 2>/dev/null || true
 
-      - name: Test binaries in Alpine container
+      - name: Smoke test in Alpine (arm64)
         run: |
-          mkdir -p testdir testdir-sftp
-          tar -xJf "dropbear-${TARGET}.tar.xz" -C testdir
-          tar -xJf "sftp-server-${TARGET}.tar.xz" -C testdir-sftp
+          mkdir -p testdir
+          tar -xJf "out/dropbear-${TARGET}.tar.xz" -C testdir
           docker run --rm --platform linux/arm64 \
             -v "$PWD/testdir/dropbear-${TARGET}:/out:ro" alpine:3 sh -lc '
             apk add --no-cache file >/dev/null 2>&1 || true
             file /out/dropbear || true
-            ldd /out/dropbear || true
             /out/dropbear -h 2>&1 | grep -E "^-y |^-Y " || (echo "MISSING -y/-Y"; exit 1)
-          '
-          docker run --rm --platform linux/arm64 \
-            -v "$PWD/testdir-sftp/sftp-server-${TARGET}:/out:ro" alpine:3 sh -lc '
-            apk add --no-cache file >/dev/null 2>&1 || true
-            file /out/sftp-server || true
-            ldd /out/sftp-server || true
+            echo "SMOKE OK"
           '
 
       - name: Upload dropbear artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dropbear-${TARGET}-${{ github.run_id }}
+          name: dropbear-${{ env.TARGET }}-${{ github.run_id }}
           overwrite: true
           path: |
-            dropbear-${{ env.TARGET }}.tar.xz
-            dropbear-${{ env.TARGET }}.tar.xz.SHA256
+            out/dropbear-${{ env.TARGET }}.tar.xz
+            out/dropbear-${{ env.TARGET }}.tar.xz.SHA256
 
-      - name: Upload sftp-server artifact
+      - name: Upload sftp-server artifact (optional)
+        if: hashFiles('out/sftp-server-*.tar.xz') != ''
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: sftp-server-${{ env.TARGET }}-${{ github.run_id }}
           overwrite: true
           path: |
-            sftp-server-${{ env.TARGET }}.tar.xz
-            sftp-server-${{ env.TARGET }}.tar.xz.SHA256
+            out/sftp-server-${{ env.TARGET }}.tar.xz
+            out/sftp-server-${{ env.TARGET }}.tar.xz.SHA256
 
   release:
     name: create github release
