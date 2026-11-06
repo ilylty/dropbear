@@ -1,85 +1,143 @@
 #!/usr/bin/env bash
-set -ev
+# Build static Dropbear (musl) with the android-passwd patch applied.
+# Everything is relative to this script's directory. No writes outside it.
+#
+#   ./build.sh                          # build for the local architecture
+#   TARGET=aarch64-linux-musl ./build.sh
+#   DROPBEAR_VERSION=2025.88 ZIG_VERSION=0.15.1 ./build.sh
+#
+# Output: ./out/dropbear-<target>.tar.xz (+ .SHA256)
+#         ./out/sftp-server-<target>.tar.xz (if OpenSSH sources are cached)
+set -eu
 
-# ---- Config ----------------------------------------------------------------
-: "${DROPBEAR_VERSION:=2025.88}"   # Dropbear release to build
-: "${ZIG_VERSION:=0.15.1}"         # Zig to use for musl cross static
-: "${JOBS:=8}"                     # parallel make
+cd "$(dirname "$0")"
 
-# TARGET may be provided by CI matrix (e.g., x86_64-linux-musl, aarch64-linux-musl
-if [[ -z "${TARGET:-}" ]]; then
+: "${DROPBEAR_VERSION:=2025.88}"
+: "${ZIG_VERSION:=0.15.1}"
+: "${JOBS:=8}"
+
+if [ -z "${TARGET:-}" ]; then
   case "$(uname -m)" in
     x86_64)  TARGET="x86_64-linux-musl" ;;
-    aarch64) TARGET="aarch64-linux-musl" ;;
-    *) echo "Unsupported arch $(uname -m). Set TARGET explicitly."; exit 1 ;;
+    aarch64|arm64) TARGET="aarch64-linux-musl" ;;
+    *) echo "Unsupported arch $(uname -m). Set TARGET explicitly." >&2; exit 1 ;;
   esac
 fi
 
-workdir="$(pwd)"
-builddir="$(mktemp -d)"
-trap 'rm -rf "$builddir"' EXIT
+ROOT="$PWD"
+CACHE="$ROOT/cache"
+OUT="$ROOT/out"
+WORK="$ROOT/build"
+PATCH="$ROOT/patches/android-passwd-support.patch"
 
-zig_pkg_arch=`uname -m`
-zig_pkg="zig-${zig_pkg_arch}-linux-${ZIG_VERSION}.tar.xz"
-zig_url="https://ziglang.org/download/${ZIG_VERSION}/${zig_pkg}"
+mkdir -p "$CACHE" "$OUT"
 
-echo "Downloading Zig ${ZIG_VERSION} for ${zig_pkg_arch}..."
-curl -fsSL "$zig_url" -o "${builddir}/${zig_pkg}"
-echo "Extracting Zig to $builddir..."
-tar -C "$builddir" -xJf "${builddir}/${zig_pkg}"
-echo "Extracted zig"
+echo "==> target: $TARGET  (dropbear $DROPBEAR_VERSION, zig $ZIG_VERSION)"
 
-zig_root="$(tar -tf "${builddir}/${zig_pkg}" | head -1 | cut -d/ -f1)"
-ZIG_BIN="${builddir}/${zig_root}/zig"
-export PATH="${builddir}/${zig_root}:$PATH"
-echo "Using Zig at: ${ZIG_BIN}"
-"${ZIG_BIN}" version
+# ---------------------------------------------------------------- zig ------
+zig_host_arch="$(uname -m)"
+zig_pkg="zig-${zig_host_arch}-linux-${ZIG_VERSION}.tar.xz"
+zig_dir="$CACHE/zig-${zig_host_arch}-linux-${ZIG_VERSION}"
 
-# --- Get Dropbear -----------------------------------------------------------
-dropbear_tar="dropbear-${DROPBEAR_VERSION}.tar.bz2"
-dropbear_url="https://matt.ucc.asn.au/dropbear/releases/${dropbear_tar}"
+if [ ! -x "$zig_dir/zig" ]; then
+  if [ ! -f "$CACHE/$zig_pkg" ]; then
+    echo "==> downloading $zig_pkg"
+    curl -fL --retry 3 --retry-delay 2 \
+      -o "$CACHE/$zig_pkg.part" \
+      "https://ziglang.org/download/${ZIG_VERSION}/${zig_pkg}"
+    mv "$CACHE/$zig_pkg.part" "$CACHE/$zig_pkg"
+  fi
+  echo "==> extracting zig"
+  tar -C "$CACHE" -xJf "$CACHE/$zig_pkg"
+fi
+ZIG="$zig_dir/zig"
+echo "==> zig: $("$ZIG" version)"
 
-echo "Downloading Dropbear ${DROPBEAR_VERSION}..."
-curl -fsSL "$dropbear_url" -o "${builddir}/${dropbear_tar}"
-echo "Extracting Dropbear..."
-tar -C "$builddir" -xjf "${builddir}/${dropbear_tar}"
-cd "${builddir}/dropbear-${DROPBEAR_VERSION}"
+# ----------------------------------------------------------- dropbear ------
+db_pkg="dropbear-${DROPBEAR_VERSION}.tar.bz2"
+if [ ! -f "$CACHE/$db_pkg" ]; then
+  echo "==> downloading $db_pkg"
+  curl -fL --retry 3 --retry-delay 2 \
+    -o "$CACHE/$db_pkg.part" \
+    "https://matt.ucc.asn.au/dropbear/releases/${db_pkg}"
+  mv "$CACHE/$db_pkg.part" "$CACHE/$db_pkg"
+fi
 
-# --- Build (static, musl) ---------------------------------------------------
-echo "Cleaning previous build (if any)…"
-make clean || true
+rm -rf "$WORK"
+mkdir -p "$WORK"
+tar -C "$WORK" -xjf "$CACHE/$db_pkg"
+SRC="$WORK/dropbear-${DROPBEAR_VERSION}"
+cd "$SRC"
 
-echo "Configuring for ${TARGET}…"
-CC="${ZIG_BIN} cc -target ${TARGET}" \
+# ------------------------------------------------------------- patch -------
+if [ -f "$PATCH" ]; then
+  echo "==> applying $(basename "$PATCH")"
+  patch -p1 --forward < "$PATCH"
+else
+  echo "==> WARNING: patch not found, building vanilla dropbear" >&2
+fi
+
+# ------------------------------------------------------------- build -------
+echo "==> configuring"
+CC="$ZIG cc -target $TARGET" \
 CFLAGS="-Os -fno-pie" \
 LDFLAGS="-static -no-pie" \
 CPPFLAGS="-DDROPBEAR_X11FWD" \
 ./configure \
-  --host="${TARGET}" \
+  --host="$TARGET" \
   --disable-pam \
   --disable-zlib \
   --enable-bundled-libtom \
-  --enable-static
+  --enable-static \
+  --disable-lastlog \
+  --disable-utmp \
+  --disable-utmpx \
+  --disable-wtmp \
+  --disable-wtmpx \
+  --disable-loginfunc \
+  --disable-pututline \
+  --disable-pututxline
 
-echo "Building dropbear…"
-make -j "${JOBS}" PROGRAMS="dropbear dbclient dropbearkey dropbearconvert scp" STATIC=1
+echo "==> compiling"
+make -j "$JOBS" PROGRAMS="dropbear dbclient dropbearkey dropbearconvert scp" STATIC=1
 
-# --- Package ----------------------------------------------------------------
-[[ -x ./dropbear ]] || { echo "Build failed: dropbear missing"; exit 1; }
-strip ./drop* dbclient scp || true
+for f in dropbear dbclient dropbearkey dropbearconvert scp; do
+  [ -x "./$f" ] || { echo "BUILD FAILED: $f missing" >&2; exit 1; }
+done
 
-# Stage files (with symlinks) inside dropbear-${TARGET}/
-stage_dir="${builddir}/stage/dropbear-${TARGET}"
-mkdir -p "${stage_dir}"
-cp ./dropbear* dbclient scp "${stage_dir}/"
+# sanity: the patched options must be present in -h output
+if ! ./dropbear -h 2>&1 | grep -q -- '-y PasswdFile'; then
+  echo "BUILD FAILED: -y option missing (patch not applied?)" >&2
+  exit 1
+fi
+if ! ./dropbear -h 2>&1 | grep -q -- '-Y SftpPath'; then
+  echo "BUILD FAILED: -Y option missing (patch not applied?)" >&2
+  exit 1
+fi
 
-# Produce dropbear-${TARGET}.tar.xz in the original working dir
-out_tar="${workdir}/dropbear-${TARGET}.tar.xz"
-echo "Creating ${out_tar}…"
-tar -C "${builddir}/stage" -cJf "${out_tar}" "dropbear-${TARGET}"
+echo "==> stripping"
+strip ./dropbear ./dbclient ./dropbearkey ./dropbearconvert ./scp || true
+file ./dropbear || true
 
-# SHA256 for convenience
-echo "SHA256: "
-sha256sum "${out_tar}" | tee "${out_tar}.SHA256"
+# ----------------------------------------------------------- package -------
+stage="$WORK/stage/dropbear-${TARGET}"
+mkdir -p "$stage"
+cp ./dropbear ./dbclient ./dropbearkey ./dropbearconvert ./scp "$stage/"
+cp "$ROOT/patches/android-passwd-support.patch" "$stage/" 2>/dev/null || true
 
-echo "Done: ${out_tar}"
+db_out="$OUT/dropbear-${TARGET}.tar.xz"
+tar -C "$WORK/stage" -cJf "$db_out" "dropbear-${TARGET}"
+( cd "$OUT" && sha256sum "$(basename "$db_out")" > "$(basename "$db_out").SHA256" )
+echo "==> wrote $db_out"
+
+# ------------------------------------------------------ sftp-server --------
+# Optional. Reuses build-sftp-server.sh which fetches OpenSSH sftp-server only.
+if [ -x "$ROOT/build-sftp-server.sh" ] && [ "${SKIP_SFTP:-0}" != "1" ]; then
+  echo "==> building sftp-server"
+  ( cd "$ROOT" && TARGET="$TARGET" ZIG_VERSION="$ZIG_VERSION" JOBS="$JOBS" \
+      ./build-sftp-server.sh ) || echo "==> sftp-server build failed (optional)" >&2
+fi
+
+echo
+echo "Done."
+ls -l "$OUT"

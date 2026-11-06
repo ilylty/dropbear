@@ -1,0 +1,399 @@
+diff --git a/Makefile.in b/Makefile.in
+index 14db073..d18afe7 100644
+--- a/Makefile.in
++++ b/Makefile.in
+@@ -37,7 +37,7 @@ endif
+ OBJ_DIR=./obj
+ MAN_DIR=@srcdir@/manpages
+ 
+-_COMMONOBJS=dbutil.o buffer.o dbhelpers.o \
++_COMMONOBJS=dbutil.o android-passwd.o buffer.o dbhelpers.o \
+ 		dss.o bignum.o \
+ 		signkey.o rsa.o dbrandom.o \
+ 		queue.o \
+diff --git a/src/android-passwd.c b/src/android-passwd.c
+new file mode 100644
+index 0000000..330a7ae
+--- /dev/null
++++ b/src/android-passwd.c
+@@ -0,0 +1,178 @@
++/* Android/read-only-rootfs support: read users from a custom passwd file
++ * instead of the libc getpwnam()/getspnam() (which hardcodes /etc/passwd and
++ * /etc/shadow, unavailable or read-only on Android).
++ *
++ * Enabled at runtime with  dropbear ... -y /data/local/tmp/dropbear/passwd
++ * The file uses the standard passwd(5) format:
++ *     name:password:uid:gid:gecos:home:shell
++ * The password field may contain the crypt hash directly ("$6$..." etc),
++ * "x" meaning "look up in the shadow file next to the passwd file",
++ * or "*"/"!" for a locked account.
++ */
++
++#include "includes.h"
++
++#if ANDROID_PASSWD_FILE
++
++#include <pwd.h>
++#include <stdio.h>
++#include <string.h>
++#include <stdlib.h>
++
++/* Set from svr-runopts (-y). NULL = use the normal libc lookup. */
++char *android_passwd_file = NULL;
++
++static struct passwd apw;
++static char *apw_name = NULL;
++static char *apw_passwd = NULL;
++static char *apw_dir = NULL;
++static char *apw_shell = NULL;
++static char *apw_gecos = NULL;
++
++static void apw_free(void) {
++    if (apw_name) { m_free(apw_name); apw_name = NULL; }
++    if (apw_passwd) { m_free(apw_passwd); apw_passwd = NULL; }
++    if (apw_dir) { m_free(apw_dir); apw_dir = NULL; }
++    if (apw_shell) { m_free(apw_shell); apw_shell = NULL; }
++    if (apw_gecos) { m_free(apw_gecos); apw_gecos = NULL; }
++}
++
++static char *apw_dup_field(const char *s) {
++    if (!s) {
++        return m_strdup("");
++    }
++    return m_strdup(s);
++}
++
++/* Look up "name" in the shadow file sitting beside the passwd file.
++ * Returns the crypt hash or NULL if the entry is absent. */
++static char *lookup_shadow(const char *username) {
++    char path[4096];
++    char line[4096];
++    FILE *fp = NULL;
++    char *slash = NULL;
++    size_t want;
++    char *result = NULL;
++
++    snprintf(path, sizeof(path), "%s", android_passwd_file);
++    slash = strrchr(path, '/');
++    if (slash) {
++        snprintf(slash + 1, sizeof(path) - (size_t)(slash + 1 - path), "shadow");
++    } else {
++        snprintf(path, sizeof(path), "shadow");
++    }
++
++    fp = fopen(path, "r");
++    if (!fp) {
++        return NULL;
++    }
++
++    want = strlen(username);
++    while (fgets(line, sizeof(line), fp) != NULL) {
++        char *saveptr = NULL;
++        char *field = NULL;
++        size_t len = strlen(line);
++        char *colon = NULL;
++
++        if (len == 0) {
++            continue;
++        }
++        if (line[len - 1] == '\n') {
++            line[len - 1] = '\0';
++        }
++
++        field = strtok_r(line, ":", &saveptr);
++        if (!field || strlen(field) != want || strncmp(field, username, want) != 0) {
++            continue;
++        }
++        /* second field is the hash */
++        field = strtok_r(NULL, ":", &saveptr);
++        if (!field) {
++            continue;
++        }
++        /* strip any trailing ":age:..." handled by strtok already */
++        colon = strchr(field, '\n');
++        if (colon) { *colon = '\0'; }
++        result = m_strdup(field);
++        break;
++    }
++    fclose(fp);
++    return result;
++}
++
++/* Parse the passwd file and fill in the static struct passwd.
++ * Returns NULL if the user is not found. */
++struct passwd *android_getpwnam(const char *username) {
++    char line[4096];
++    FILE *fp = NULL;
++    struct passwd *ret = NULL;
++    size_t want = strlen(username);
++
++    if (!android_passwd_file) {
++        return NULL;
++    }
++
++    fp = fopen(android_passwd_file, "r");
++    if (!fp) {
++        dropbear_log(LOG_WARNING, "Cannot open passwd file %s",
++                android_passwd_file);
++        return NULL;
++    }
++
++    while (fgets(line, sizeof(line), fp) != NULL) {
++        char *f[7];
++        char *saveptr = NULL;
++        char *tok = NULL;
++        int nf = 0;
++        size_t len = strlen(line);
++
++        if (len == 0 || line[0] == '#') {
++            continue;
++        }
++        if (line[len - 1] == '\n') {
++            line[len - 1] = '\0';
++        }
++
++        for (tok = strtok_r(line, ":", &saveptr); tok && nf < 7;
++                tok = strtok_r(NULL, ":", &saveptr)) {
++            f[nf++] = tok;
++        }
++        if (nf < 7) {
++            continue;
++        }
++        if (strlen(f[0]) != want || strncmp(f[0], username, want) != 0) {
++            continue;
++        }
++
++        apw_free();
++        apw_name = m_strdup(f[0]);
++        apw_dir = apw_dup_field(f[5]);
++        apw_shell = apw_dup_field(f[6]);
++        apw_gecos = apw_dup_field(f[4]);
++
++        if (strcmp(f[1], "x") == 0) {
++            char *sp = lookup_shadow(f[0]);
++            apw_passwd = sp ? sp : m_strdup("!!");
++            if (!sp) {
++                dropbear_log(LOG_DEBUG, "No shadow entry for %s", f[0]);
++            }
++        } else {
++            apw_passwd = apw_dup_field(f[1]);
++        }
++
++        apw.pw_name = apw_name;
++        apw.pw_passwd = apw_passwd;
++        apw.pw_uid = (uid_t)strtoul(f[2], NULL, 10);
++        apw.pw_gid = (gid_t)strtoul(f[3], NULL, 10);
++        apw.pw_gecos = apw_gecos;
++        apw.pw_dir = apw_dir;
++        apw.pw_shell = apw_shell;
++        ret = &apw;
++        break;
++    }
++
++    fclose(fp);
++    return ret;
++}
++
++#endif /* ANDROID_PASSWD_FILE */
+diff --git a/src/common-session.c b/src/common-session.c
+index d420d6f..64a3b64 100644
+--- a/src/common-session.c
++++ b/src/common-session.c
+@@ -655,7 +655,15 @@ void fill_passwd(const char* username) {
+ 	if (ses.authstate.pw_passwd)
+ 		m_free(ses.authstate.pw_passwd);
+ 
+-	pw = getpwnam(username);
++#if ANDROID_PASSWD_FILE
++	/* -y given: parse our own passwd(5) file (Android /etc is read-only) */
++	if (android_passwd_file) {
++		pw = android_getpwnam(username);
++	} else
++#endif
++	{
++		pw = getpwnam(username);
++	}
+ 	if (!pw) {
+ 		return;
+ 	}
+@@ -666,6 +674,12 @@ void fill_passwd(const char* username) {
+ 	ses.authstate.pw_shell = m_strdup(pw->pw_shell);
+ 	{
+ 		char *passwd_crypt = pw->pw_passwd;
++#if ANDROID_PASSWD_FILE
++		/* android_getpwnam() already resolved the shadow field */
++		if (android_passwd_file) {
++			goto have_crypt;
++		}
++#endif
+ #ifdef HAVE_SHADOW_H
+ 		/* "x" for the passwd crypt indicates shadow should be used */
+ 		if (pw->pw_passwd && strcmp(pw->pw_passwd, "x") == 0) {
+@@ -683,6 +697,9 @@ void fill_passwd(const char* username) {
+ 			/* android supposedly returns NULL */
+ 			passwd_crypt = "!!";
+ 		}
++#if ANDROID_PASSWD_FILE
++have_crypt:
++#endif
+ 		ses.authstate.pw_passwd = m_strdup(passwd_crypt);
+ 	}
+ }
+diff --git a/src/dbutil.h b/src/dbutil.h
+index bfbed73..ed3cc52 100644
+--- a/src/dbutil.h
++++ b/src/dbutil.h
+@@ -93,6 +93,12 @@ time_t monotonic_now(void);
+ void gettime_wrapper(struct timespec *now);
+ 
+ char * expand_homedir_path(const char *inpath);
++
++#if ANDROID_PASSWD_FILE
++/* Custom passwd(5) file lookup, used when -y is given */
++extern char *android_passwd_file;
++struct passwd *android_getpwnam(const char *username);
++#endif
+ char * expand_homedir_path_home(const char *inpath, const char *homedir);
+ 
+ void fsync_parent_dir(const char* fn);
+diff --git a/src/default_options.h b/src/default_options.h
+index 6e58a29..9c173b1 100644
+--- a/src/default_options.h
++++ b/src/default_options.h
+@@ -328,6 +328,15 @@ group1 in Dropbear server too */
+ #define DROPBEAR_SFTPSERVER 1
+ #define SFTPSERVER_PATH "/usr/libexec/sftp-server"
+ 
++/* Android/read-only-rootfs: allow a custom passwd file to be used instead of
++ * the libc getpwnam()/getspnam(), via the server option
++ *   -y /path/to/passwd
++ * The shadow (if the passwd field is "x") is read from a "shadow" file in the
++ * same directory. */
++#ifndef ANDROID_PASSWD_FILE
++#define ANDROID_PASSWD_FILE 1
++#endif
++
+ /* This is used by the scp binary when used as a client binary. If you're
+  * not using the Dropbear client, you'll need to change it */
+ #define DROPBEAR_PATH_SSH_PROGRAM "/usr/bin/dbclient"
+diff --git a/src/runopts.h b/src/runopts.h
+index f255882..9cbe8ae 100644
+--- a/src/runopts.h
++++ b/src/runopts.h
+@@ -66,6 +66,13 @@ typedef struct svr_runopts {
+ 
+ 	char * bannerfile;
+ 
++#if ANDROID_PASSWD_FILE
++	/* -y <passwd file>, NULL = use libc getpwnam() */
++	char * passwd_file;
++#endif
++	/* -Y <sftp-server path>, NULL = SFTPSERVER_PATH */
++	char * sftpserver_path;
++
+ 	int forkbg;
+ 
+ 	/* ports and addresses are arrays of the portcount
+diff --git a/src/svr-auth.c b/src/svr-auth.c
+index 895aff6..458c763 100644
+--- a/src/svr-auth.c
++++ b/src/svr-auth.c
+@@ -314,6 +314,15 @@ static int checkusername(const char *username, unsigned int userlen) {
+ 		usershell = "/bin/sh";
+ 	}
+ 
++#if ANDROID_PASSWD_FILE
++	/* With a custom passwd file (-y) we trust the shell field verbatim:
++	 * Android has no /etc/shells and shells live in /system/bin. */
++	if (android_passwd_file) {
++		TRACE(("custom passwd file, trusting shell %s", usershell))
++		goto goodshell;
++	}
++#endif
++
+ 	/* check the shell is valid. If /etc/shells doesn't exist, getusershell()
+ 	 * should return some standard shells like "/bin/sh" and "/bin/csh" (this
+ 	 * is platform-specific) */
+diff --git a/src/svr-chansession.c b/src/svr-chansession.c
+index 2ca6fc1..351c1a2 100644
+--- a/src/svr-chansession.c
++++ b/src/svr-chansession.c
+@@ -682,7 +682,9 @@ static int sessioncommand(struct Channel *channel, struct ChanSess *chansess,
+ 		if (issubsys) {
+ #if DROPBEAR_SFTPSERVER
+ 			if ((cmdlen == 4) && strncmp(chansess->cmd, "sftp", 4) == 0) {
+-				char *expand_path = expand_homedir_path(SFTPSERVER_PATH);
++				char *expand_path = expand_homedir_path(
++					svr_opts.sftpserver_path ? svr_opts.sftpserver_path
++					                         : SFTPSERVER_PATH);
+ 				m_free(chansess->cmd);
+ 				chansess->cmd = m_strdup(expand_path);
+ 				m_free(expand_path);
+diff --git a/src/svr-runopts.c b/src/svr-runopts.c
+index 709dc57..a27afbf 100644
+--- a/src/svr-runopts.c
++++ b/src/svr-runopts.c
+@@ -102,6 +102,12 @@ static void printhelp(const char * progname) {
+ 					"		(default port is %s if none specified)\n"
+ 					"-P PidFile	Create pid file PidFile\n"
+ 					"		(default %s)\n"
++#if ANDROID_PASSWD_FILE
++					"-y PasswdFile	Read users from PasswdFile instead of /etc/passwd\n"
++					"		(the \"shadow\" file in the same dir is used for hashes)\n"
++#endif
++					"-Y SftpPath	Path to the sftp-server binary\n"
++					"		(default %s)\n"
+ #ifdef SO_BINDTODEVICE
+ 					"-l <interface>\n"
+ 					"		interface to bind on\n"
+@@ -136,6 +142,7 @@ static void printhelp(const char * progname) {
+ #endif
+ 					MAX_AUTH_TRIES,
+ 					DROPBEAR_MAX_PORTS, DROPBEAR_DEFPORT, DROPBEAR_PIDFILE,
++					SFTPSERVER_PATH,
+ 					DEFAULT_RECV_WINDOW, DEFAULT_KEEPALIVE, DEFAULT_IDLE_TIMEOUT);
+ }
+ 
+@@ -176,6 +183,10 @@ void svr_getopts(int argc, char ** argv) {
+ 	svr_opts.hostkey = NULL;
+ 	svr_opts.delay_hostkey = 0;
+ 	svr_opts.pidfile = expand_homedir_path(DROPBEAR_PIDFILE);
++#if ANDROID_PASSWD_FILE
++	svr_opts.passwd_file = NULL;
++#endif
++	svr_opts.sftpserver_path = NULL;
+ 	svr_opts.authorized_keys_dir = "~/.ssh";
+ #if DROPBEAR_SVR_LOCALANYFWD
+ 	svr_opts.nolocaltcp = 0;
+@@ -279,6 +290,14 @@ void svr_getopts(int argc, char ** argv) {
+ 				case 'P':
+ 					next = &svr_opts.pidfile;
+ 					break;
++#if ANDROID_PASSWD_FILE
++				case 'y':
++					next = &svr_opts.passwd_file;
++					break;
++#endif
++				case 'Y':
++					next = &svr_opts.sftpserver_path;
++					break;
+ #ifdef SO_BINDTODEVICE
+ 				case 'l':
+ 					next = &svr_opts.interface;
+@@ -460,6 +479,16 @@ void svr_getopts(int argc, char ** argv) {
+ 		dropbear_exit("Bad -D");
+ 	}
+ 
++#if ANDROID_PASSWD_FILE
++	if (svr_opts.passwd_file) {
++		if (svr_opts.passwd_file[0] == '\0') {
++			dropbear_exit("Bad -y");
++		}
++		/* Make the path available to android_getpwnam() */
++		android_passwd_file = svr_opts.passwd_file;
++	}
++#endif
++
+ #if DROPBEAR_PLUGIN
+ 	if (pubkey_plugin) {
+ 		svr_opts.pubkey_plugin = m_strdup(pubkey_plugin);
