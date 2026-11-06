@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Build static Dropbear (musl) with the android-passwd patch applied.
-# Everything is relative to this script's directory. No writes outside it.
+# This is the script GitHub Actions runs; it is also usable locally.
+# Everything is relative to this script's directory.
 #
-#   ./build.sh                          # build for the local architecture
+#   ./build.sh
 #   TARGET=aarch64-linux-musl ./build.sh
 #   DROPBEAR_VERSION=2025.88 ZIG_VERSION=0.15.1 ./build.sh
 #
 # Output: ./out/dropbear-<target>.tar.xz (+ .SHA256)
-#         ./out/sftp-server-<target>.tar.xz (if OpenSSH sources are cached)
 set -eu
 
 cd "$(dirname "$0")"
@@ -28,11 +28,22 @@ ROOT="$PWD"
 CACHE="$ROOT/cache"
 OUT="$ROOT/out"
 WORK="$ROOT/build"
-PATCH="$ROOT/patches/android-passwd-support.patch"
+
+# The patch may live in ./patches/ (standalone layout) or ./ (repo root layout)
+PATCH=""
+for cand in "$ROOT/patches/android-passwd-support.patch" \
+            "$ROOT/android-passwd-support.patch"; do
+  if [ -f "$cand" ]; then PATCH="$cand"; break; fi
+done
+if [ -z "$PATCH" ]; then
+  echo "ERROR: android-passwd-support.patch not found." >&2
+  echo "       Looked in ./patches/ and ./" >&2
+  exit 1
+fi
 
 mkdir -p "$CACHE" "$OUT"
-
 echo "==> target: $TARGET  (dropbear $DROPBEAR_VERSION, zig $ZIG_VERSION)"
+echo "==> patch : $PATCH"
 
 # ---------------------------------------------------------------- zig ------
 zig_host_arch="$(uname -m)"
@@ -70,11 +81,13 @@ SRC="$WORK/dropbear-${DROPBEAR_VERSION}"
 cd "$SRC"
 
 # ------------------------------------------------------------- patch -------
-if [ -f "$PATCH" ]; then
-  echo "==> applying $(basename "$PATCH")"
-  patch -p1 --forward < "$PATCH"
-else
-  echo "==> WARNING: patch not found, building vanilla dropbear" >&2
+echo "==> applying $(basename "$PATCH")"
+patch -p1 --forward < "$PATCH"
+
+# patch must have landed, otherwise the build is useless for Android
+if ! grep -q 'ANDROID_PASSWD_FILE' src/default_options.h; then
+  echo "ERROR: patch applied but ANDROID_PASSWD_FILE missing" >&2
+  exit 1
 fi
 
 # ------------------------------------------------------------- build -------
@@ -106,14 +119,10 @@ for f in dropbear dbclient dropbearkey dropbearconvert scp; do
 done
 
 # sanity: the patched options must be present in -h output
-if ! ./dropbear -h 2>&1 | grep -q -- '-y PasswdFile'; then
-  echo "BUILD FAILED: -y option missing (patch not applied?)" >&2
-  exit 1
-fi
-if ! ./dropbear -h 2>&1 | grep -q -- '-Y SftpPath'; then
-  echo "BUILD FAILED: -Y option missing (patch not applied?)" >&2
-  exit 1
-fi
+./dropbear -h 2>&1 | grep -q -- '-y PasswdFile' || {
+  echo "BUILD FAILED: -y option missing (patch not applied?)" >&2; exit 1; }
+./dropbear -h 2>&1 | grep -q -- '-Y SftpPath' || {
+  echo "BUILD FAILED: -Y option missing (patch not applied?)" >&2; exit 1; }
 
 echo "==> stripping"
 strip ./dropbear ./dbclient ./dropbearkey ./dropbearconvert ./scp || true
@@ -123,7 +132,7 @@ file ./dropbear || true
 stage="$WORK/stage/dropbear-${TARGET}"
 mkdir -p "$stage"
 cp ./dropbear ./dbclient ./dropbearkey ./dropbearconvert ./scp "$stage/"
-cp "$ROOT/patches/android-passwd-support.patch" "$stage/" 2>/dev/null || true
+cp "$PATCH" "$stage/" 2>/dev/null || true
 
 db_out="$OUT/dropbear-${TARGET}.tar.xz"
 tar -C "$WORK/stage" -cJf "$db_out" "dropbear-${TARGET}"
@@ -131,7 +140,6 @@ tar -C "$WORK/stage" -cJf "$db_out" "dropbear-${TARGET}"
 echo "==> wrote $db_out"
 
 # ------------------------------------------------------ sftp-server --------
-# Optional. Reuses build-sftp-server.sh which fetches OpenSSH sftp-server only.
 if [ -x "$ROOT/build-sftp-server.sh" ] && [ "${SKIP_SFTP:-0}" != "1" ]; then
   echo "==> building sftp-server"
   ( cd "$ROOT" && TARGET="$TARGET" ZIG_VERSION="$ZIG_VERSION" JOBS="$JOBS" \
