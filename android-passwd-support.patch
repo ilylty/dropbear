@@ -13,10 +13,10 @@ index 14db073..d18afe7 100644
  		queue.o \
 diff --git a/src/android-passwd.c b/src/android-passwd.c
 new file mode 100644
-index 0000000..330a7ae
+index 0000000..19e0026
 --- /dev/null
 +++ b/src/android-passwd.c
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,175 @@
 +/* Android/read-only-rootfs support: read users from a custom passwd file
 + * instead of the libc getpwnam()/getspnam() (which hardcodes /etc/passwd and
 + * /etc/shadow, unavailable or read-only on Android).
@@ -30,6 +30,7 @@ index 0000000..330a7ae
 + */
 +
 +#include "includes.h"
++#include "dbutil.h"
 +
 +#if ANDROID_PASSWD_FILE
 +
@@ -91,7 +92,6 @@ index 0000000..330a7ae
 +        char *saveptr = NULL;
 +        char *field = NULL;
 +        size_t len = strlen(line);
-+        char *colon = NULL;
 +
 +        if (len == 0) {
 +            continue;
@@ -109,9 +109,6 @@ index 0000000..330a7ae
 +        if (!field) {
 +            continue;
 +        }
-+        /* strip any trailing ":age:..." handled by strtok already */
-+        colon = strchr(field, '\n');
-+        if (colon) { *colon = '\0'; }
 +        result = m_strdup(field);
 +        break;
 +    }
@@ -171,10 +168,10 @@ index 0000000..330a7ae
 +
 +        if (strcmp(f[1], "x") == 0) {
 +            char *sp = lookup_shadow(f[0]);
-+            apw_passwd = sp ? sp : m_strdup("!!");
 +            if (!sp) {
 +                dropbear_log(LOG_DEBUG, "No shadow entry for %s", f[0]);
 +            }
++            apw_passwd = sp ? sp : m_strdup("!!");
 +        } else {
 +            apw_passwd = apw_dup_field(f[1]);
 +        }
