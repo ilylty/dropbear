@@ -1,4 +1,4 @@
-name: Build, Test & Release Dropbear Binaries
+name: Build arm64 Dropbear (Android)
 
 on:
   push:
@@ -7,18 +7,10 @@ on:
 
 jobs:
   build:
-    name: build ${{ matrix.target }}
-    runs-on: ${{ matrix.runs_on }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-linux-musl
-            runs_on: ubuntu-latest
-          - target: aarch64-linux-musl
-            runs_on: ubuntu-24.04-arm
-
+    name: build aarch64-linux-musl
+    runs-on: ubuntu-24.04-arm
     env:
+      TARGET: aarch64-linux-musl
       DROPBEAR_VERSION: 2025.88
       ZIG_VERSION: 0.15.1
       JOBS: 8
@@ -32,94 +24,80 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl ca-certificates tar bzip2 xz-utils patch autoconf automake make gcc g++ cmake ninja-build
+          sudo apt-get install -y curl ca-certificates tar bzip2 xz-utils patch \
+            autoconf automake make gcc g++ cmake ninja-build
 
       - name: Make build scripts executable
         run: |
           git update-index --chmod=+x build.sh || true
-          git update-index --chmod=+x build-sftp-openssh.sh || true
+          git update-index --chmod=+x build-sftp-server.sh || true
 
-      - name: Build static dropbearmulti (musl + android passwd patch)
-        env:
-          TARGET: ${{ matrix.target }}
-          DROPBEAR_VERSION: ${{ env.DROPBEAR_VERSION }}
-          ZIG_VERSION: ${{ env.ZIG_VERSION }}
-          JOBS: ${{ env.JOBS }}
+      - name: Build static dropbear (musl + android passwd patch)
         run: ./build.sh
 
       - name: Show dropbear outputs
-        run: ls -l dropbear-*.tar.xz*
+        run: ls -l dropbear-*.tar.xz* 2>/dev/null || ls -l out/
 
       - name: Build static sftp-server (OpenSSH)
         env:
-          TARGET: ${{ matrix.target }}
           OPENSSH_VERSION: 9.8p1
-          ZIG_VERSION: ${{ env.ZIG_VERSION }}
-          JOBS: ${{ env.JOBS }}
-        run: ./build-sftp-openssh.sh
+        run: ./build-sftp-server.sh
 
       - name: Show sftp outputs
-        run: ls -l sftp-server-*.tar.xz*
+        run: ls -l sftp-server-*.tar.xz* 2>/dev/null || true
 
       - name: Test binaries in Alpine container
-        env:
-          TARGET: ${{ matrix.target }}
         run: |
-          case "$TARGET" in
-            x86_64-linux-musl) plat="linux/amd64" ;;
-            aarch64-linux-musl) plat="linux/arm64" ;;
-            *) echo "Unknown TARGET $TARGET"; exit 1 ;;
-          esac
           mkdir -p testdir testdir-sftp
           tar -xJf "dropbear-${TARGET}.tar.xz" -C testdir
           tar -xJf "sftp-server-${TARGET}.tar.xz" -C testdir-sftp
-          docker run --rm --platform "${plat}" -v "$PWD/testdir/dropbear-${TARGET}:/out:ro" alpine:3 sh -lc '
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD/testdir/dropbear-${TARGET}:/out:ro" alpine:3 sh -lc '
             apk add --no-cache file >/dev/null 2>&1 || true
             file /out/dropbear || true
             ldd /out/dropbear || true
             /out/dropbear -h 2>&1 | grep -E "^-y |^-Y " || (echo "MISSING -y/-Y"; exit 1)
           '
-          docker run --rm --platform "${plat}" -v "$PWD/testdir-sftp/sftp-server-${TARGET}:/out:ro" alpine:3 sh -lc '
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD/testdir-sftp/sftp-server-${TARGET}:/out:ro" alpine:3 sh -lc '
             apk add --no-cache file >/dev/null 2>&1 || true
             file /out/sftp-server || true
             ldd /out/sftp-server || true
           '
 
-      - name: Upload dropbear artifact (tarballs)
+      - name: Upload dropbear artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dropbear-${{ matrix.target }}
+          name: dropbear-${TARGET}-${{ github.run_id }}
           overwrite: true
           path: |
-            dropbear-${{ matrix.target }}.tar.xz
-            dropbear-${{ matrix.target }}.tar.xz.SHA256
+            dropbear-${{ env.TARGET }}.tar.xz
+            dropbear-${{ env.TARGET }}.tar.xz.SHA256
 
-      - name: Upload sftp-server artifact (tarballs)
+      - name: Upload sftp-server artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sftp-server-${{ matrix.target }}
+          name: sftp-server-${{ env.TARGET }}-${{ github.run_id }}
           overwrite: true
           path: |
-            sftp-server-${{ matrix.target }}.tar.xz
-            sftp-server-${{ matrix.target }}.tar.xz.SHA256
+            sftp-server-${{ env.TARGET }}.tar.xz
+            sftp-server-${{ env.TARGET }}.tar.xz.SHA256
 
   release:
     name: create github release
     needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: dist
 
-      - name: List artifacts
-        run: ls -lR dist
+      - run: ls -lR dist
 
-      - name: Create / Update Release
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
